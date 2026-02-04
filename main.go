@@ -1,16 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math"
+	"net"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
@@ -194,7 +197,7 @@ type curvePoint struct {
 }
 
 type curveProfile struct {
-	floorEndTemp int // temps < floorEndTemp => floorSpeed
+	floorEndTemp int // temps < floorEndTemp => floorSpeed (we actually use AUTO at floor in this build)
 	floorSpeed   int
 	floorHyst    int
 	points       []curvePoint // sorted by temp; curve only between these setpoints; >= last temp => last speed
@@ -214,10 +217,9 @@ func clampInt(x, lo, hi int) int {
 // - Treat the LOWEST min_temperature range as the "floor range".
 //   Use its max_temperature as floorEndTemp, and its fan_speed as floorSpeed.
 // - Every OTHER range contributes a setpoint at (min_temperature -> fan_speed) with its hysteresis.
-// - Below floorEndTemp: fixed floorSpeed.
+// - Below floorEndTemp: floor behavior (AUTO policy in our current logic).
 // - Between setpoints: linear interpolation.
 // - Above last setpoint: fixed at last setpoint speed.
-// This matches: "floor + ceiling, smooth only between setpoints".
 func buildCurveProfileFromRanges(ranges []TemperatureRange) (curveProfile, error) {
 	var prof curveProfile
 	if len(ranges) == 0 {
@@ -264,8 +266,6 @@ func buildCurveProfileFromRanges(ranges []TemperatureRange) (curveProfile, error
 		dedup = append(dedup, p)
 	}
 	prof.points = dedup
-
-	// If there are no setpoints, curve mode degenerates to "always floorSpeed".
 	return prof, nil
 }
 
@@ -309,9 +309,96 @@ func curveSpeedForTempWithProfile(temp int, prof curveProfile) (int, int) {
 			return speed, a.hyst
 		}
 	}
-
-	// Fallback (shouldn't hit)
 	return last.speed, last.hyst
+}
+
+// ---------- Gamemode socket (one thing) ----------
+
+const gamemodeSockPath = "/run/nvidia_fan_control.gamemode.sock"
+
+// 0 = off, 1 = on
+var gameModeLock atomic.Uint32
+var gameModeSeq  atomic.Uint64  // increments on every gamemode command (on/off/status)
+
+func startGamemodeSocketServer() error {
+	_ = os.Remove(gamemodeSockPath)
+
+	ln, err := net.Listen("unix", gamemodeSockPath)
+	if err != nil {
+		return fmt.Errorf("gamemode socket listen failed (%s): %w", gamemodeSockPath, err)
+	}
+
+	// Let unprivileged users talk to it (no sudoers/group dance).
+	_ = os.Chmod(gamemodeSockPath, 0666)
+
+	log.Printf("INFO: Gamemode socket listening on %s", gamemodeSockPath)
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				// If the listener dies, we can't really recover inside the daemon loop.
+				log.Printf("ERROR: Gamemode socket accept failed: %v", err)
+				return
+			}
+
+			go func(c net.Conn) {
+				defer c.Close()
+				rd := bufio.NewReader(c)
+				line, _ := rd.ReadString('\n')
+				cmd := strings.TrimSpace(line)
+
+				switch cmd {
+				case "on":
+					gameModeLock.Store(1)
+					gameModeSeq.Add(1)
+					_, _ = c.Write([]byte("ok\n"))
+
+				case "off":
+					gameModeLock.Store(0)
+					gameModeSeq.Add(1)
+					_, _ = c.Write([]byte("ok\n"))
+
+				case "status":
+					// Count status calls too, so the monitoring loop can log them.
+					gameModeSeq.Add(1)
+					if gameModeLock.Load() == 1 {
+						_, _ = c.Write([]byte("on\n"))
+					} else {
+						_, _ = c.Write([]byte("off\n"))
+					}
+
+				default:
+					_, _ = c.Write([]byte("error: expected on|off|status\n"))
+				}
+			}(conn)
+		}
+	}()
+
+	return nil
+}
+
+
+func sendGamemodeCommand(cmd string) (string, error) {
+	conn, err := net.Dial("unix", gamemodeSockPath)
+	if err != nil {
+		return "", fmt.Errorf("unable to connect to daemon gamemode socket (%s): %w", gamemodeSockPath, err)
+	}
+	defer conn.Close()
+
+	if !strings.HasSuffix(cmd, "\n") {
+		cmd += "\n"
+	}
+	if _, err := conn.Write([]byte(cmd)); err != nil {
+		return "", fmt.Errorf("unable to write gamemode command: %w", err)
+	}
+
+	rd := bufio.NewReader(conn)
+	resp, err := rd.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("unable to read gamemode response: %w", err)
+	}
+	return strings.TrimSpace(resp), nil
 }
 
 func runMonitoringLoop(config Config, count int, fanCounts []int, prevTemps []int, prevFanSpeeds [][]int) {
@@ -345,10 +432,62 @@ func runMonitoringLoop(config Config, count int, fanCounts []int, prevTemps []in
 	lastFanChangeTemp := make([]int, count)
 	copy(lastFanChangeTemp, prevTemps)
 
+	// tiny helper for concise fan lists
+	formatFanList := func(fans []int) string {
+		if len(fans) == 0 {
+			return ""
+		}
+		if len(fans) == 1 {
+			return fmt.Sprintf("%d", fans[0])
+		}
+		var b strings.Builder
+		for i, f := range fans {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString(strconv.Itoa(f))
+		}
+		return b.String()
+	}
+
+	// --- NEW: gamemode event logging (logs on on/off/status calls) ---
+	// gameModeSeq must be incremented by the command handler on EVERY gamemode command.
+	lastSeenGameModeSeq := gameModeSeq.Load()
+	lastSeenGameModeLock := gameModeLock.Load()
+	if lastSeenGameModeLock != 0 {
+		log.Printf("INFO: GameMode: ON (lock AUTO below floor)")
+	} else {
+		log.Printf("INFO: GameMode: OFF")
+	}
+
 	ticker := time.NewTicker(time.Duration(config.TimeToUpdate) * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
+		// --- NEW: log any gamemode command event (even if state unchanged, e.g. status) ---
+		seq := gameModeSeq.Load()
+		if seq != lastSeenGameModeSeq {
+			lock := gameModeLock.Load()
+			if lock != 0 {
+				log.Printf("INFO: GameMode: ON (lock AUTO below floor)")
+			} else {
+				log.Printf("INFO: GameMode: OFF")
+			}
+			lastSeenGameModeSeq = seq
+			lastSeenGameModeLock = lock
+		} else {
+			// Optional: keep this just in case something flips lock without bumping seq
+			lock := gameModeLock.Load()
+			if lock != lastSeenGameModeLock {
+				if lock != 0 {
+					log.Printf("INFO: GameMode: ON (lock AUTO below floor)")
+				} else {
+					log.Printf("INFO: GameMode: OFF")
+				}
+				lastSeenGameModeLock = lock
+			}
+		}
+
 		for i := 0; i < count; i++ {
 			if fanCounts[i] == 0 {
 				continue
@@ -374,12 +513,19 @@ func runMonitoringLoop(config Config, count int, fanCounts []int, prevTemps []in
 				if inAuto[i] {
 					if tempInt >= prof.floorEndTemp+prof.floorHyst {
 						inAuto[i] = false
-						log.Printf("INFO: GPU %d crossing above floor: switching to MANUAL control (temp=%d°C)", i, tempInt)
+
+						// Log target speed we will attempt in MANUAL at this temp (concise)
+						targetSpeed, _ := curveSpeedForTempWithProfile(tempInt, prof)
+						log.Printf("INFO: GPU %d crossing above floor: switching to MANUAL control (temp=%d°C, target=%d%%)",
+							i, tempInt, targetSpeed)
 					}
 				} else {
-					if tempInt <= prof.floorEndTemp-prof.floorHyst {
-						inAuto[i] = true
-						log.Printf("INFO: GPU %d crossing below floor: switching to AUTO control (temp=%d°C)", i, tempInt)
+					// GameMode ON => lock out MANUAL->AUTO below the floor
+					if gameModeLock.Load() == 0 {
+						if tempInt <= prof.floorEndTemp-prof.floorHyst {
+							inAuto[i] = true
+							log.Printf("INFO: GPU %d crossing below floor: switching to AUTO control (temp=%d°C)", i, tempInt)
+						}
 					}
 				}
 
@@ -397,28 +543,37 @@ func runMonitoringLoop(config Config, count int, fanCounts []int, prevTemps []in
 						}
 					}
 
-					// In AUTO, we should not treat any previous manual temp as the hysteresis reference.
-					// Reset the "last change" reference so when we re-enter MANUAL we don't block updates.
+					// Reset hysteresis reference when in AUTO.
 					lastFanChangeTemp[i] = tempInt
 					prevTemps[i] = tempInt
 					continue
 				}
 
 				// Above floor => MANUAL policy + curve target.
-				anyFanUpdated := false
+				// We keep behavior identical but log concisely + aggregate same-command updates.
+				targetSpeed, hyst := curveSpeedForTempWithProfile(tempInt, prof)
+
+				// Curve hysteresis: compare to last successful change temperature.
+				if abs(tempInt-lastFanChangeTemp[i]) < hyst {
+					prevTemps[i] = tempInt
+					continue
+				}
+
+				// We only update fans whose prev speed differs (same as before), but we aggregate logs.
+				changedFans := make([]int, 0, fanCounts[i])
 				for fanIdx := 0; fanIdx < fanCounts[i]; fanIdx++ {
-					prevSpeed := prevFanSpeeds[i][fanIdx]
-					newFanSpeed, hyst := curveSpeedForTempWithProfile(tempInt, prof)
-
-					if newFanSpeed == prevSpeed {
-						continue
+					if prevFanSpeeds[i][fanIdx] != targetSpeed {
+						changedFans = append(changedFans, fanIdx)
 					}
+				}
 
-					// Curve hysteresis: compare to last successful change temperature.
-					if abs(tempInt-lastFanChangeTemp[i]) < hyst {
-						continue
-					}
+				if len(changedFans) == 0 {
+					prevTemps[i] = tempInt
+					continue
+				}
 
+				anyFanUpdated := false
+				for _, fanIdx := range changedFans {
 					ret = nvml.DeviceSetFanControlPolicy(device, fanIdx, nvml.FAN_POLICY_MANUAL)
 					if ret != nvml.SUCCESS && ret != nvml.ERROR_NOT_SUPPORTED {
 						log.Printf("ERROR: Unable to set MANUAL fan policy for GPU %d Fan %d: %v", i, fanIdx, nvml.ErrorString(ret))
@@ -428,22 +583,29 @@ func runMonitoringLoop(config Config, count int, fanCounts []int, prevTemps []in
 						continue
 					}
 
-					ret = nvml.DeviceSetFanSpeed_v2(device, fanIdx, newFanSpeed)
+					ret = nvml.DeviceSetFanSpeed_v2(device, fanIdx, targetSpeed)
 					if ret != nvml.SUCCESS {
-						log.Printf("ERROR: Unable to set fan speed for GPU %d Fan %d to %d%%: %v", i, fanIdx, newFanSpeed, nvml.ErrorString(ret))
+						log.Printf("ERROR: Unable to set fan speed for GPU %d Fan %d to %d%%: %v", i, fanIdx, targetSpeed, nvml.ErrorString(ret))
 						continue
 					}
 
-					log.Printf("INFO: Updated GPU %d Fan %d (curve): Temp=%d°C, PrevSpeed=%d%%, NewSpeed=%d%%, Hyst=%d°C",
-						i, fanIdx, tempInt, prevSpeed, newFanSpeed, hyst)
-
-					prevFanSpeeds[i][fanIdx] = newFanSpeed
+					prevFanSpeeds[i][fanIdx] = targetSpeed
 					anyFanUpdated = true
 				}
 
 				if anyFanUpdated {
+					// One concise line for all fans that were intended to change.
+					if len(changedFans) == 1 {
+						log.Printf("INFO: Updated GPU %d Fan %d (curve): Temp=%d°C, Speed=%d%%, Hyst=%d°C",
+							i, changedFans[0], tempInt, targetSpeed, hyst)
+					} else {
+						log.Printf("INFO: Updated GPU %d Fans [%s] (curve): Temp=%d°C, Speed=%d%%, Hyst=%d°C",
+							i, formatFanList(changedFans), tempInt, targetSpeed, hyst)
+					}
+
 					lastFanChangeTemp[i] = tempInt
 				}
+
 				prevTemps[i] = tempInt
 				continue
 			}
@@ -482,14 +644,16 @@ func runMonitoringLoop(config Config, count int, fanCounts []int, prevTemps []in
 }
 
 
+
 // ---------- CLI plumbing (quiet by default) ----------
 
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage:
-  nvidia_fan_control daemon   [-config PATH] [-log PATH] [-curve]
-  nvidia_fan_control status   [-gpu N] [-v]
-  nvidia_fan_control set      [-gpu N] [-fans "0,1"] -speed PERCENT [-v]
-  nvidia_fan_control auto     [-gpu N] [-fans "0,1"] [-v]
+  nvidia_fan_control daemon    [-config PATH] [-log PATH] [-curve]
+  nvidia_fan_control status    [-gpu N] [-v]
+  nvidia_fan_control set       [-gpu N] [-fans "0,1"] -speed PERCENT [-v]
+  nvidia_fan_control auto      [-gpu N] [-fans "0,1"] [-v]
+  nvidia_fan_control gamemode  on|off|status
 
 daemon mode is EXACTLY the original behavior by default:
   - reads config.json from current directory
@@ -497,9 +661,13 @@ daemon mode is EXACTLY the original behavior by default:
 
 Curve mode (daemon only):
   - uses the LOWEST-min range as the floor region:
-      temps < floor.max_temperature => floor.fan_speed
+      temps < floor.max_temperature => floor (AUTO policy)
   - uses subsequent ranges as setpoints at min_temperature
   - interpolates only between setpoints (smooth transition), with floor+ceiling clamps
+
+Gamemode toggle:
+  - talks to the daemon via: /run/nvidia_fan_control.gamemode.sock
+  - when ON: daemon will NOT transition from MANUAL -> AUTO (i.e. won't drop back to floor/AUTO)
 `)
 }
 
@@ -734,6 +902,30 @@ func cmdAuto(gpuIdx int, fans []int, verbose bool) int {
 	return 0
 }
 
+func cmdGamemode(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "gamemode: expected on|off|status")
+		return 2
+	}
+	cmd := strings.TrimSpace(args[0])
+	if cmd != "on" && cmd != "off" && cmd != "status" {
+		fmt.Fprintln(os.Stderr, "gamemode: expected on|off|status")
+		return 2
+	}
+
+	resp, err := sendGamemodeCommand(cmd)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+
+	// Keep output minimal and script-friendly
+	if cmd == "status" {
+		fmt.Println(resp)
+	}
+	return 0
+}
+
 func cmdDaemon(configPath, logPath string, curveOverride bool) int {
 	logFile, err := setupLogging(logPath)
 	if err != nil {
@@ -741,6 +933,18 @@ func cmdDaemon(configPath, logPath string, curveOverride bool) int {
 		return 1
 	}
 	defer logFile.Close()
+
+	// Start gamemode socket (one thing)
+	if err := startGamemodeSocketServer(); err != nil {
+		log.Printf("WARN: Unable to start gamemode socket server: %v", err)
+	} else {
+		log.Printf("INFO: Gamemode initial state: %s", func() string {
+			if gameModeLock.Load() == 1 {
+				return "on"
+			}
+			return "off"
+		}())
+	}
 
 	config, err := loadConfiguration(configPath)
 	if err != nil {
@@ -844,6 +1048,9 @@ func main() {
 			os.Exit(2)
 		}
 		os.Exit(cmdAuto(*gpuIdx, fans, *verbose))
+
+	case "gamemode":
+		os.Exit(cmdGamemode(os.Args[2:]))
 
 	default:
 		printUsage()
