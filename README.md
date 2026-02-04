@@ -83,6 +83,19 @@ Example:
 sudo nvidia_fan_control daemon -config /home/user/.nvidia_fan_control/config.json -curve
 ```
 
+### 'Game Mode'
+Call from tools like gamemoderun in the custom section
+- `nvidia_fan_control gamemode on`: Tells the daemon to switch to game mode. This prevents the tool from setting the fan to AUTO, in practice this mean the fan will stay in the lowest manual set state instead of retuning to 0% or system control, for when a game is running and you want to force a higher setting as the floor.
+- `nvidia_fan_control gamemode off`: Tells the daemon to return to normal operation, allowing AUTO.
+- `nvidia_fan_control gamemode status`: Returns the current game mode setting.
+
+Example gamemoderun config usage:
+
+```[custom]
+start=/usr/local/bin/nvidia_fan_control gamemode on
+end=/usr/local/bin/nvidia_fan_control gamemode off
+```
+
 ## Configuration
 
 Edit the file `config.json` with the following structure:
@@ -109,7 +122,7 @@ In curve mode, the daemon uses your config as **anchors** and interpolates betwe
 
 A common pattern:
 
-- `<40°C` => AUTO floor / idle behavior
+- `<40°C` => AUTO floor / idle behavior, setting a speed of 0 in the config will set the fans to AUTO
 - `40°C` => 60%
 - `60°C+` => 100%
 
